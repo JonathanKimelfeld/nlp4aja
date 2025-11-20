@@ -1,47 +1,42 @@
+import argparse
+import copy
+import csv
+import datetime
+import json
+import logging
+import math
+import os
+import random
+import sys
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 from sklearn.metrics import classification_report
-
-import argparse
-import datetime
-import math
-import os
-import csv
-import numpy as np
-import logging
-import random
-
+from utils import split_train_val
+from char_cnn_tagger import CharCNNTagger
 from char_lstm_tagger import CharLSTMTagger
 from lstm_tagger import LSTMTagger
-from char_cnn_tagger import CharCNNTagger
 from mtl_wrapper import MTLWrapper
+from data_classes import write_sentences_to_excel
 try:
     import load_data
-    from utils import split_train_val
-    from data_classes import write_sentences_to_excel
+    import split_train_test_val
+    import train_test_split
 except:
     pass
+
+from debug_run import *
+from mask_utils import *
+
+DEBUG_MASK = False
 
 UNKNOWN = 'UNKNOWN'
 FLAT = "flat"
 MTL = "multitask"
 HIERARCHICAL = "hierarchical"
 THRESHOLD = 2
-
-
-def get_index_of_max(input):
-    index = 0
-    for i in range(1, len(input)):
-        if input[i] > input[index]:
-            index = i
-    return index
-
-
-def get_max_prob_result(input, ix_to_tag):
-    return ix_to_tag[get_index_of_max(input)]
-
 
 def prepare_char_sequence(word, to_ix):
     idxs = []
@@ -125,7 +120,7 @@ def train(training_data, val_data, model_path, word_dict_path, char_dict_path,
           hidden_dim, dropout, num_kernels=1000, kernel_width=6, by_char=False,
           by_bpe=False, with_smoothing=False, cnn=False, directions=1, device='cpu',
           save_all_models=False, save_best_model=True, epochs=300, lr=0.1, batch_size=8,
-          morph=None, weight_decay=0, loss_weights=(1,1,1,1,1), seed=42):
+          morph=None, weight_decay=0, loss_weights=(1,1,1,1,1), seed=42, legal_morph=False):
 
     # training data of shape: [(sent, tags), (sent, tags)]
     # where sent is of shape: [(word, bpe), (word, bpe)], len(sent) == number of words
@@ -197,22 +192,63 @@ def train(training_data, val_data, model_path, word_dict_path, char_dict_path,
         logger.info(f"Finished preparing MTL data:")
         logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
 
-        mtl_model = train_tag(train_sents, val_sents, all_train_field_tags, all_val_field_tags, model_path,
-                              word_to_ix, char_to_ix, bpe_to_ix, all_field_dicts, word_emb_dim, char_emb_dim,
-                              hidden_dim, dropout, num_kernels, kernel_width, by_char, by_bpe, cnn, directions,
-                              device, save_all_models, save_best_model, epochs, lr, batch_size,
-                              weight_decay=weight_decay, loss_weights=loss_weights, seed=seed)
+        mtl_model = train_tag(train_sents=train_sents, val_pos_list=val_poses, val_sents=val_sents,
+                              train_tags=all_train_field_tags,
+                              val_tags=all_val_field_tags, model_path=model_path, word_to_ix=word_to_ix,
+                              char_to_ix=char_to_ix, bpe_to_ix=bpe_to_ix, pos_tag_dictionary=all_field_dicts,
+                              word_emb_dim=word_emb_dim, char_emb_dim=char_emb_dim, hidden_dim=hidden_dim,
+                              dropout=dropout, num_kernels=num_kernels, kernel_width=kernel_width, by_char=by_char,
+                              by_bpe=by_bpe, cnn=cnn, directions=directions, device=device,
+                              save_all_models=save_all_models, save_best_model=save_best_model, epochs=epochs, lr=lr,
+                              batch_size=batch_size, weight_decay=weight_decay, loss_weights=loss_weights, seed=seed,
+                              legal_morph=legal_morph, mask_train=getattr(args, 'mask_train', False),
+                              mask_val=getattr(args, 'mask_val', False),
+                              treat_gold_illegal_as_underscore=getattr(args, 'treat_gold_illegal_as_underscore', True))
         return mtl_model
 
     logger.info("Preparing POS training data:")
     logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
 
-    pos_model = train_tag(train_sents, val_sents, train_poses, val_poses, pos_model_path, word_to_ix,
-                          char_to_ix, bpe_to_ix, [pos_to_ix],
-                          word_emb_dim, char_emb_dim, hidden_dim, dropout, num_kernels,
-                          kernel_width, by_char, by_bpe, cnn, directions,
-                          device, save_all_models, save_best_model, epochs, lr,
-                          batch_size, weight_decay=weight_decay, seed=seed)
+    pos_tag_dictionary = {value: key for key, value in pos_to_ix.items()}
+
+    pos_model = train_tag(
+        train_pos_list=train_poses,
+        train_sents=train_sents,
+        val_pos_list=val_poses,
+        val_sents=val_sents,
+        train_tags=train_poses,
+        field_idx=-1,
+        val_tags=val_poses,
+        model_path=pos_model_path,
+        word_to_ix=word_to_ix,
+        char_to_ix=char_to_ix,
+        bpe_to_ix=bpe_to_ix,
+        tag_to_ix_list=[pos_to_ix],
+        pos_tag_dictionary=pos_tag_dictionary,
+        word_emb_dim=word_emb_dim,
+        char_emb_dim=char_emb_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        num_kernels=num_kernels,
+        kernel_width=kernel_width,
+        by_char=by_char,
+        by_bpe=by_bpe,
+        cnn=cnn,
+        directions=directions,
+        device=device,
+        save_all_models=save_all_models,
+        save_best_model=save_best_model,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        weight_decay=weight_decay,
+        pos_dict_size=0,
+        seed=seed,
+        legal_morph=legal_morph,
+        mask_train=getattr(args, 'mask_train', False),
+        mask_val=getattr(args, 'mask_val', False),
+        treat_gold_illegal_as_underscore=getattr(args, 'treat_gold_illegal_as_underscore', True)
+    )
 
     if morph == FLAT or morph == HIERARCHICAL:
 
@@ -237,12 +273,18 @@ def train(training_data, val_data, model_path, word_dict_path, char_dict_path,
                                   for word_idx, tag_idx in zip(sent, sent_tags[0])]
                                  for sent, sent_tags in zip(val_sents, val_poses)]
         field_models = [pos_model]
-        for field_idx, field_name in enumerate(field_names[1:]):
+        ix_to_pos = reverse_dict(pos_to_ix)
+        
+        if legal_morph:
+            collect_and_write_illegal_tag_statistics(training_data, field_names, model_path, logger=logger)
+        
+        for field_idx, field_name in enumerate(field_names[1:], start=1):
 
             logger.info(f"Preparing {field_name} training data:")
             logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
 
-            field_training_data = [(sent, [tag_set[field_idx+1] for tag_set in tags]) for sent, tags in training_data]
+            field_training_data = [(sentence, [tag_set[field_idx] for tag_set in tags]) for sentence, tags in
+                                   training_data]
 
             field_tag_to_ix = prepare_tag_dict(field_training_data)
             field_dict_path = dict_path_parts[0] + f"-{field_name}." + dict_path_parts[1]
@@ -250,21 +292,64 @@ def train(training_data, val_data, model_path, word_dict_path, char_dict_path,
 
             field_model_path = model_path_parts[0] + f"-{field_name}." + model_path_parts[1]
             if val_data:
-                val_field_tags = [[prepare_target(tag_sets, field_tag_to_ix, field_idx=(field_idx+1)).to(device=device)]
+                val_field_tags = [[prepare_target(tag_sets, field_tag_to_ix, field_idx=field_idx).to(device=device)]
                                   for (val_sent, tag_sets) in val_data]
             else:
                 val_field_tags = None
-            train_field_tags = [[prepare_target(tag_sets, field_tag_to_ix, field_idx=field_idx+1).to(device=device)]
+            train_field_tags = [[prepare_target(tag_sets, field_tag_to_ix, field_idx=field_idx).to(device=device)]
                                 for (train_sent, tag_sets) in training_data]
 
             logger.info(f"Finished preparing {field_name} data:")
             logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
 
-            field_model = train_tag(train_sents, val_sents, train_field_tags, val_field_tags, field_model_path,
-                                    word_to_ix, char_to_ix, bpe_to_ix, [field_tag_to_ix], word_emb_dim, char_emb_dim,
-                                    hidden_dim, dropout, num_kernels, kernel_width, by_char, by_bpe, cnn, directions,
-                                    device, save_all_models, save_best_model, epochs, lr, batch_size,
-                                    weight_decay=weight_decay, pos_dict_size=pos_dict_size, seed=seed)
+            ix_to_field_tag = reverse_dict(field_tag_to_ix)
+
+            if legal_morph:
+                scan_field_rules_and_check_constraints(
+                    field_idx, field_name, val_poses, ix_to_pos, ix_to_field_tag, field_tag_to_ix
+                )
+            
+            # pack POS + tag_to_ix field mappings for train_tag
+            pos_and_field_tag_to_ix = [pos_to_ix, field_tag_to_ix]
+
+            field_model = train_tag(
+                train_pos_list=train_poses,
+                train_sents=train_sents,
+                val_pos_list=val_poses,
+                val_sents=val_sents,
+                train_tags=train_field_tags,
+                field_idx=field_idx,
+                val_tags=val_field_tags,
+                model_path=field_model_path,
+                word_to_ix=word_to_ix,
+                char_to_ix=char_to_ix,
+                bpe_to_ix=bpe_to_ix,
+                tag_to_ix_list=pos_and_field_tag_to_ix,
+                pos_tag_dictionary=pos_tag_dictionary,
+                word_emb_dim=word_emb_dim,
+                char_emb_dim=char_emb_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout,
+                num_kernels=num_kernels,
+                kernel_width=kernel_width,
+                by_char=by_char,
+                by_bpe=by_bpe,
+                cnn=cnn,
+                directions=directions,
+                device=device,
+                save_all_models=save_all_models,
+                save_best_model=save_best_model,
+                epochs=epochs,
+                lr=lr,
+                batch_size=batch_size,
+                weight_decay=weight_decay,
+                pos_dict_size=pos_dict_size,
+                seed=seed,
+                legal_morph=legal_morph,
+                mask_train=getattr(args, 'mask_train', False),
+                mask_val=getattr(args, 'mask_val', False),
+                treat_gold_illegal_as_underscore=getattr(args, 'treat_gold_illegal_as_underscore', True)
+            )
             field_models.append(field_model)
 
         return field_models[0], field_models[1], field_models[2], field_models[3], field_models[4]
@@ -273,178 +358,251 @@ def train(training_data, val_data, model_path, word_dict_path, char_dict_path,
         return pos_model
 
 
-def train_tag(train_sents, val_sents, train_tags, val_tags, model_path, word_to_ix, char_to_ix,
-              bpe_to_ix, tag_to_ix_list, word_emb_dim, char_emb_dim,
+def train_tag(train_pos_list, train_sents, val_pos_list, val_sents, train_tags, field_idx, val_tags, model_path,
+              word_to_ix, char_to_ix,
+              bpe_to_ix, tag_to_ix_list, pos_tag_dictionary, word_emb_dim, char_emb_dim,
               hidden_dim, dropout, num_kernels=1000, kernel_width=6, by_char=False,
               by_bpe=False, cnn=False, directions=1, device='cpu',
               save_all_models=False, save_best_model=True, epochs=300, lr=0.1,
-              batch_size=8, weight_decay=0, pos_dict_size=0, loss_weights=None, seed=42):
+              batch_size=8, weight_decay=0, pos_dict_size=0, loss_weights=None, seed=42, legal_morph=False,
+              mask_train=False, mask_val=False, treat_gold_illegal_as_underscore=True):
     """
     This is the central function that runs the training process; it trains a model on a given tag (or set of tags),
     with or without early stopping, based on the hyperparameters provided to the function call. It saves and returns
     the best model.
+    Trains a single analysis field (field_idx) – or POS when field_idx == -1.
+    If `legal_morph` is True and field_idx > -1, predictions are passed
+    through `apply_legal_mask` before computing filtered metrics.
+    D1 = Raw accuracy (all tokens)
+    D2 = Filtered accuracy (tokens with constrained rules)
+    D3 = Filtered accuracy with legal-morph masking (tokens with constrained rules and non-null, legal gold)
     """
+    if DEBUG_MASK:
+        debug_validate_tag_inputs(field_idx, train_pos_list, train_sents, train_tags,
+                                  val_pos_list, val_sents, val_tags, tag_to_ix_list)
 
     random.seed(seed)
     torch.manual_seed(seed)
     torch.autograd.set_detect_anomaly(True)
 
+
+    field_names = ['pos', 'an1', 'an2', 'an3', 'enc']
+    field_name = field_names[field_idx] if field_idx >= 0 else 'pos'
+    print(f"Training {field_name}")
+
+    pos_tag_to_ix = tag_to_ix_list[0]
+    field_tag_to_ix = tag_to_ix_list[1] if len(tag_to_ix_list) > 1 else pos_tag_to_ix
+
+    pos_ix_to_tag = reverse_dict(pos_tag_to_ix)
+    field_ix_to_tag = reverse_dict(field_tag_to_ix)
+
+    assert_bijection(field_tag_to_ix, field_ix_to_tag, field_name)
+
+    logits_dim = len(field_ix_to_tag)
+    print(f"[vocab] [{field_name}] logits_dim={logits_dim}")
+
     base_model = base_model_factory(by_char or by_bpe, cnn)
-
-    model = MTLWrapper(word_emb_dim, char_emb_dim, hidden_dim, dropout, len(word_to_ix),
-                       len(char_to_ix) if by_char else len(bpe_to_ix), [len(tag_to_ix) for tag_to_ix in tag_to_ix_list],
-                       num_kernels, kernel_width, directions=directions, device=device, model_type=base_model,
-                       pos_dict_size=pos_dict_size)
-
-    # move to gpu if supported
+    model = MTLWrapper(
+        word_emb_dim, char_emb_dim, hidden_dim, dropout,
+        len(word_to_ix),
+        len(char_to_ix) if by_char else len(bpe_to_ix),
+        [logits_dim],
+        num_kernels, kernel_width,
+        directions=directions, device=device,
+        model_type=base_model, pos_dict_size=pos_dict_size
+    )
+    
     model = model.to(device=device)
 
-    loss_function = nn.NLLLoss().to(device=device)
+    loss_fn = nn.NLLLoss().to(device)
     optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     logger.info("Begin training:")
     logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
 
-    best_score = math.inf
-    best_model = None
-    best_model_path = None
+    # flatten POS once for masking calls
+    train_pos_flat = [p[0] if isinstance(p, (list, tuple)) else p
+                      for p in train_pos_list]
+    val_pos_flat = [p[0] if isinstance(p, (list, tuple)) else p
+                    for p in val_pos_list]
+
+    if legal_morph and field_idx in (1, 2, 3):
+        legal_rules_for_field = get_legal_rules_for_field(field_idx)
+        sanity_check_mask_activation(
+            model=model,
+            predict_fn=predict_tags,
+            val_sents=val_sents,
+            val_pos_flat=val_pos_flat,
+            field_tag_to_ix=field_tag_to_ix,
+            field_ix_to_tag=field_ix_to_tag,
+            pos_ix_to_tag=pos_ix_to_tag,
+            field_idx=field_idx,
+            field_name=field_name,
+            legal_rules_for_field=legal_rules_for_field,
+        )
+
+    best_val_loss = float('inf')
+    best_state = None
     patience = 0
-    val_loss = None
+
     for epoch in range(epochs):
+        # diagnostics per epoch (for masking)
+        train_diag = new_diag()
+
         model.train()
-        running_loss = 0.0
-        if epoch % 10 == 0:
-            logger.info("Beginning epoch {}:".format(epoch))
-            logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
-            sys.stdout.flush()
-        count = 0
-        r = list(range(len(train_sents)))
-        random.shuffle(r)
+        epoch_loss = 0.0
+        token_cnt = 0
 
-        for i in range(math.ceil(len(train_sents)/batch_size)):
-            batch = r[i*batch_size:(i+1)*batch_size]
-            losses = []
-            for j in batch:
+        shuffled_idx = random.sample(range(len(train_sents)), len(train_sents))
+        for start in range(0, len(shuffled_idx), batch_size):
+            batch_ids = shuffled_idx[start:start + batch_size]
+            batch_loss = 0.0
 
-                sentence = train_sents[j]
-                tags = train_tags[j]
+            for idx in batch_ids:
+                sent = train_sents[idx]
+                gold = train_tags[idx]
 
-                # skip sentences with zero words or zero tags (though it should be equivalent)
-                if (not len(sentence)) or (not len(tags)):
-                    continue
-                # Step 1. Remember that Pytorch accumulates gradients.
-                # We need to clear them out before each instance
-                model.zero_grad()
-
-                # Also, we need to clear out the hidden state of the LSTM,
-                # detaching it from its history on the last instance.
                 model.hidden = model.init_hidden(hidden_dim)
+                logits = model(sent)  # list of [Tensors]
 
-                sentence_in = sentence
-                targets = tags
+                train_diag["total_tokens"] += len(logits[0])
 
-                # Step 3. Run our forward pass.
-                tag_scores = model(sentence_in)
-
-                loss = [loss_function(tag_scores[i], targets[i]) for i in range(len(tag_scores))]
-                loss = torch.stack(loss)
-                if loss_weights:
-                    if len(loss_weights) != len(loss):
-                        logger.info(f"Received {len(loss_weights)} weights, for {len(loss)} tasks. Using equal weights.")
-                        avg_loss = sum(loss)/len(loss)
-                    else:
-                        weighted_loss_sum = 0
-                        for task_loss, weight in zip(loss, loss_weights):
-                            weighted_loss_sum += task_loss*weight
-                        avg_loss = weighted_loss_sum/sum(loss_weights)
-
+                # Apply train-time masking if enabled (on analysis fields only)
+                if legal_morph and mask_train and field_idx > 0:
+                    masked_loss = apply_training_mask_and_loss(
+                        logits=logits,
+                        gold=gold,
+                        field_idx=field_idx,
+                        field_name=field_name,
+                        field_tag_to_ix=field_tag_to_ix,
+                        field_ix_to_tag=field_ix_to_tag,
+                        pos_ix_to_tag=pos_ix_to_tag,
+                        pos_indices_flat=train_pos_flat[idx],
+                        train_diag=train_diag,
+                        loss_fn=loss_fn,
+                        treat_gold_illegal_as_underscore=treat_gold_illegal_as_underscore,
+                        legal_values=legal_values,
+                    )
+                    batch_loss += masked_loss
                 else:
-                    avg_loss = sum(loss)/len(loss)
-                losses.append(avg_loss)
+                    loss_vec = [loss_fn(l, g) for l, g in zip(logits, gold)]
+                    batch_loss += torch.stack(loss_vec).mean()
 
-            # Step 4. Compute the loss, gradients, and update the parameters by
-            #  calling optimizer.step()
+            batch_loss /= len(batch_ids)
+            epoch_loss += batch_loss.item() * len(batch_ids)
+            token_cnt += len(batch_ids)
 
-            losses = torch.stack(losses)
-            total_loss = sum(losses)/len(losses)  # average over all sentences in batch
-            total_loss.backward()
-            running_loss += total_loss.item()
+            optimizer.zero_grad()
+            batch_loss.backward()
             optimizer.step()
-            count += 1
 
-        if patience == 5 and best_model:
-            if save_best_model:
-                logger.info("Saving best model at {}".format(model_path))
-                torch.save(best_model.state_dict(), model_path)
-                logger.info("Best validation loss: {}".format(best_score))
-                sys.stdout.flush()
-            break
+        model.eval()
+        with torch.no_grad():
+            train_logits = predict_tags(model, train_sents)
+            debug_len_pairs(train_logits, train_tags, ctx="chk/train_raw")
+            assert_TV_shapes(train_logits, train_tags, ctx="train_raw")
 
-        predicted_train = predict_tags(model, train_sents)
-        logger.info("Loss and accuracy at epoch {}:".format(epoch))
-        logger.info("Loss on training data: {}".format(running_loss/count))
-        if val_sents:
-            predicted_val = predict_tags(model, val_sents)
+            train_raw_acc = calculate_accuracy(train_logits, train_tags)
 
-            val_loss = get_loss_on_val(val_sents, val_tags, predicted_val, loss_weights)
+            if legal_morph and mask_val and field_idx > 0:
+                train_masked = apply_legal_mask(
+                    train_logits, train_pos_flat,
+                    field_tag_to_ix, field_ix_to_tag, pos_ix_to_tag,
+                    field_idx, field_name
+                )
+                debug_len_pairs(train_masked, train_tags, ctx="chk/train_filt")
+                assert_TV_shapes(train_masked, train_tags, ctx="train_filt")
 
-            logger.info("Loss on validation data: {}".format(val_loss))
-            val_accuracy = calculate_accuracy(predicted_val, val_tags)
-            logger.info("Accuracy on validation data: {}".format(val_accuracy))
+                normalized_train_logits = normalize_logits_to_list_list(train_logits)
 
-        train_accuracy = calculate_accuracy(predicted_train, train_tags)
-
-        logger.info("Accuracy on training data: {}".format(train_accuracy))
-
-        save_path = model_path.split(".")
-        save_path = save_path[0] + "_epoch_" + str(epoch + 1) + "." + save_path[1]
-        if val_sents:
-            if val_loss < best_score:
-
-                base_model = base_model_factory(by_char or by_bpe, cnn)
-
-                best_model = MTLWrapper(word_emb_dim, char_emb_dim, hidden_dim, dropout,
-                                        len(word_to_ix), len(char_to_ix) if by_char else len(bpe_to_ix),
-                                        [len(tag_to_ix) for tag_to_ix in tag_to_ix_list], num_kernels,
-                                        kernel_width, directions=directions, device=device, model_type=base_model,
-                                        pos_dict_size=pos_dict_size)
-
-                best_model.load_state_dict(model.state_dict())
-                best_model_path = save_path
-                best_score = val_loss
-                best_accuracy = val_accuracy
-                patience = 0
+                legal_rules_for_field = get_legal_rules_for_field(field_idx)
+                train_filt_acc, train_filt_stats = calculate_accuracy_for_filtered_predictions(
+                    train_masked, train_tags,
+                    pos_list=train_pos_flat,
+                    field_idx=field_idx,
+                    field_tag_to_ix=field_tag_to_ix,
+                    field_ix_to_tag=field_ix_to_tag,
+                    pos_ix_to_tag=pos_ix_to_tag,
+                    legal_rules_for_field=legal_rules_for_field,
+                    raw_unmasked_scores=normalized_train_logits
+                )
             else:
-                patience += 1
-            logger.info("Patience: {}".format(patience))
-        if save_all_models:
-            logger.info("Saving model at checkpoint.")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': running_loss/count,
-                'val_loss': val_loss
-            }, save_path)
+                train_filt_acc = None
+                train_filt_stats = None
 
-        if epoch == epochs - 1 and best_model and best_model_path and save_best_model:
-            logger.info("Reached max epochs")
-            logger.info("Saving best model at {}".format(model_path))
-            torch.save(best_model.state_dict(), model_path)
-            if val_sents:
-                logger.info("Best validation loss: {}".format(best_score))
-                logger.info("Best validation accuracy: {}".format(best_accuracy))
-            break
+        if val_sents:
+            val_diag = new_diag()
 
-            sys.stdout.flush()
-    logger.info("Finished training:")
-    logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
+            with torch.no_grad():
+                val_logits = predict_tags(model, val_sents)
+                debug_len_pairs(val_logits, val_tags, ctx="chk/val_raw")
+                assert_TV_shapes(val_logits, val_tags, ctx="val_raw")
+                val_raw_acc = calculate_accuracy(val_logits, val_tags)
 
-    if not best_model_path:
-        logger.info("We never found a best model, saving final model")
-        torch.save(model.state_dict(), model_path)
+                val_loss = get_loss_on_val(
+                    val_sents, val_tags, val_logits, loss_weights
+                )
 
-    return best_model
+                if legal_morph and mask_val and field_idx > 0:
+                    val_filt_acc, val_filt_stats = apply_validation_mask_metrics(
+                        val_logits=val_logits,
+                        val_tags=val_tags,
+                        val_pos_flat=val_pos_flat,
+                        field_idx=field_idx,
+                        field_name=field_name,
+                        field_tag_to_ix=field_tag_to_ix,
+                        field_ix_to_tag=field_ix_to_tag,
+                        pos_ix_to_tag=pos_ix_to_tag,
+                        logits_dim=logits_dim,
+                        val_diag=val_diag,
+                        debug_mask=DEBUG_MASK,
+                    )
+                    select_acc = val_filt_acc
+                else:
+                    val_filt_acc = None
+                    val_filt_stats = None
+                    select_acc = val_raw_acc
+
+        train_raw_at_d3_str = f"{train_filt_stats['raw_at_d3']:.4f}" if (train_filt_stats is not None and train_filt_stats.get('raw_at_d3') is not None) else 'n/a'
+        val_raw_at_d3_str = f"{val_filt_stats['raw_at_d3']:.4f}" if (val_filt_stats is not None and val_filt_stats.get('raw_at_d3') is not None) else 'n/a'
+        logger.info(
+            f"Epoch {epoch:3d} | "
+            f"train loss {epoch_loss / token_cnt:.4f} | "
+            f"train raw (D1) {train_raw_acc:.4f} "
+            f"train raw@D3 (D3) {train_raw_at_d3_str} "
+            f"train filt (D3) {train_filt_acc if train_filt_acc is not None else 'n/a'} | "
+            f"val raw (D1) {val_raw_acc:.4f} "
+            f"val raw@D3 (D3) {val_raw_at_d3_str} "
+            f"val filt (D3) {val_filt_acc if val_filt_acc is not None else 'n/a'}"
+        )
+
+        if legal_morph and field_idx > 0:
+            val_diag_for_log = val_diag if (val_sents and 'val_diag' in locals()) else None
+            log_mask_diagnostics(train_diag, val_diag_for_log, train_filt_stats, val_filt_stats, field_idx, val_sents)
+
+        if train_diag["masked_tokens"] > 0:
+            assert train_diag[
+                       "saw_minus_inf"] > 0, "Masking did not write -1e9 into tags during TRAIN (check mask_train path)."
+
+        # early-stopping on filtered (or raw) val loss
+        if val_sents and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            patience = 0
+        else:
+            patience += 1
+            if patience == 5:
+                logger.info("Early stop: patience exhausted")
+                break
+
+        model.train()
+
+    # save best model
+    if save_best_model and best_state is not None:
+        torch.save(best_state, model_path)
+
+    logger.info("Training finished.")
+    return model if best_state is None else best_state
 
 
 def prepare_data_for_mtl(field_names, training_data, val_data, device, dict_path_parts, test=False):
@@ -601,6 +759,8 @@ def get_loss_on_val(val_sents, val_tags, predicted_tags, loss_weights):
         if not loss_weights:
             loss_weights = [1]*len(predicted)
         for task_pred, task_tags, weight in zip(predicted, tags, loss_weights):
+            task_pred = task_pred.view(-1, task_pred.size(-1))
+            task_tags = task_tags.view(-1)
             sent_loss += weight*loss_function(task_pred, task_tags)
         avg_sent_loss = sent_loss/sum(loss_weights)
         loss += avg_sent_loss
@@ -608,57 +768,183 @@ def get_loss_on_val(val_sents, val_tags, predicted_tags, loss_weights):
 
 
 def predict_tags(model, sents):
+    """
+    Predicting tags for a given model and a given set of sentences.
+    In case the sentence is empty, append an empty list to the predicted tags.
+    Upon receiving an invalid sentence, raise an error.
+    """
     model = model.eval()
     predicted = []
+    invalid_line_counter = 0
+
     for sent in sents:
-        if len(sent) == 0:
-            predicted.append([])
-        else:
-            predicted_tags = model(sent)
-            predicted.append(predicted_tags)
+
+        try:
+            if len(sent) == 0:
+                predicted.append([])
+            else:
+                predicted_tags = model(sent)
+                predicted.append(predicted_tags)
+
+        except RuntimeError as e:
+            if 'zero batch' in str(e):
+                predicted.append([])
+                invalid_line_counter += 1
+            else:
+                print("An invalid sentence was given. Check input in cleaning stage.")
+                raise e
+
+    if invalid_line_counter != 0:
+        print(f"{invalid_line_counter} invalid sentences found in the given input.")
+
     return predicted
 
 
 def calculate_accuracy(predicted_tag_scores, true_tags_2d):
     """
-    Shape of predicted_tag_scores: []
-        len(predicted_tag_scores) = len(sentences)
-        len(predicted_tag_scores[i]) = num_fields (this is a tensor)
-        shape(predicted_tag_scores[j]) = torch.size(num_tags_in_field_j, num_words_in_sentence)
-    Therefore shape of results:
-        len(results) = len(sentences)*num_fields, with [[tags of sent_1,field_1], [tags of sent_1,field_2], ...]
-    And shape of true_tags is the same as results
-    :param predicted_tag_scores:
-    :param true_tags_2d:
-    :return:
+    Computes accuracy across all sentences and fields using a vectorized approach.
+    predicted_tag_scores: list[list[torch.Tensor]] # Sentences -> Fields -> Tensor(num_words, num_tags)
+    true_tags_2d: list[list[torch.Tensor]] # Sentences -> Fields -> Tensor(num_words)
     """
+    correct, total = 0, 0
 
-    score = 0
-    results = [[np.argmax(word_scores.cpu().detach().numpy()) for word_scores in field_scores]
-               for sent_scores in predicted_tag_scores for field_scores in sent_scores]
-    true_tags = [tag for tags in true_tags_2d for tag in tags]
-    num_tags = 0
-    for sent_result, sent_true in zip(results, true_tags):
-        sent_true = sent_true.cpu()
-        for result, true in zip(np.array(sent_result).flatten(), np.array(sent_true).flatten()):
-            if result == true:
-                score += 1
-            num_tags += 1
-    return score/num_tags
+    # The vectorized implementation expects a flat list of fields, where prediction
+    # tensors are shaped (num_tags, num_words). Raw predictions from the model are
+    # (num_words, num_tags) and are nested in sentences, so we flatten and transpose.
+    predicted = [field.T for sent in predicted_tag_scores for field in sent]
+    gold = [field for sent in true_tags_2d for field in sent]
+
+    for field_scores, gold_field in zip(predicted, gold):
+        preds = field_scores.argmax(dim=0)
+        correct += (preds.cpu() == gold_field.cpu()).sum().item()
+        total += gold_field.numel()
+
+    return (correct / total) if total > 0 else 0.0
 
 
-def get_pos_from_idxs_path(pos_idxs, pos_dict_path):
-    pos_dict = torch.load(pos_dict_path)
-    ix_to_tag = reverse_dict(pos_dict)
-    literal_pos_tags = [[ix_to_tag.get(tag, 'OOV') for tag in sentence] for sentence in pos_idxs]
-    return literal_pos_tags
+def extract_field_logits(predicted_sents, field_idx=0):
+    """
+    Normalize raw model outputs into a list-of-sentences structure that
+    contains a single head per sentence (matching the expected shape for
+    masking/metrics helpers).
+    """
+    extracted = []
+    target_idx = 0 if field_idx is None else field_idx
+    for sentence_scores in predicted_sents:
+        if isinstance(sentence_scores, list):
+            if 0 <= target_idx < len(sentence_scores):
+                field_scores = sentence_scores[target_idx]
+            else:
+                field_scores = sentence_scores[0]
+        else:
+            field_scores = sentence_scores
+        field_scores = ensure_2d_tensor(field_scores)
+        extracted.append([field_scores])
+    return extracted
+
+
+def select_gold_field_tags(true_tags_nested, field_offset):
+    selected = []
+    target_idx = max(0, field_offset or 0)
+    for sent_fields in true_tags_nested:
+        if isinstance(sent_fields, list) and sent_fields:
+            idx = target_idx if target_idx < len(sent_fields) else 0
+            selected.append([sent_fields[idx]])
+        else:
+            selected.append(sent_fields)
+    return selected
+
+
+def logits_to_predictions(field_logits):
+    """Convert [sentences → [field_tensor]] logits into index predictions."""
+    predictions = []
+    for sent_fields in field_logits:
+        if not sent_fields:
+            predictions.append([])
+            continue
+        field_tensor = ensure_2d_tensor(sent_fields[0])
+        if hasattr(field_tensor, "shape") and field_tensor.shape[0] == 0:
+            predictions.append([])
+            continue
+        if hasattr(field_tensor, "dim") and field_tensor.dim() == 2:
+            preds = field_tensor.argmax(dim=1).detach().cpu().tolist()
+        else:
+            tensor_cpu = torch.as_tensor(field_tensor).detach().cpu()
+            preds = tensor_cpu.argmax(dim=1).tolist() if tensor_cpu.dim() == 2 else []
+        predictions.append(preds)
+    return predictions
+
+
+def combine_field_predictions(per_field_predictions):
+    """Transpose list[field][sentence] → list[sentence][field]."""
+    if not per_field_predictions:
+        return []
+    num_sentences = len(per_field_predictions[0])
+    combined = []
+    for sent_idx in range(num_sentences):
+        sentence_fields = []
+        for field_preds in per_field_predictions:
+            if sent_idx < len(field_preds):
+                sentence_fields.append(field_preds[sent_idx])
+            else:
+                sentence_fields.append([])
+        combined.append(sentence_fields)
+    return combined
+
+
+def flatten_pos_sequences(pos_sequences):
+    """Normalize POS sequences into torch.LongTensor per sentence."""
+    if not pos_sequences:
+        return []
+    flattened = []
+    for entry in pos_sequences:
+        if isinstance(entry, (list, tuple)):
+            if not entry:
+                flattened.append(torch.LongTensor([]))
+                continue
+            candidate = entry[0]
+        else:
+            candidate = entry
+        if isinstance(candidate, torch.Tensor):
+            flattened.append(candidate.detach().cpu())
+        else:
+            flattened.append(torch.LongTensor(candidate))
+    return flattened
+
+
+def warn_if_filtered_lt_raw(stats, split_label):
+    raw_at_d3_val = stats.get('raw_at_d3')
+    if raw_at_d3_val is None or stats.get('D3', 0) == 0:
+        return
+    filtered = stats.get('filtered_accuracy')
+    if filtered is None:
+        return
+    if filtered + 1e-6 < raw_at_d3_val:
+        print(f"[warn {split_label}] filtered({filtered:.4f}) < raw@D3({raw_at_d3_val:.4f}) "
+              f"on D3={stats['D3']}")
+
+
+def log_filtered_policy_stats(split_label, field_name, stats):
+    raw_at_d3_val = stats.get('raw_at_d3')
+    raw_at_d3_str = (f"{raw_at_d3_val:.4f}" if raw_at_d3_val is not None
+                     else "n/a" if stats.get('D3', 0) == 0 else "n/a")
+    print(f"[{split_label} filtered] Exclude policy over D3 ({field_name}): "
+          f"D1={stats['D1']} D2={stats['D2']} D3={stats['D3']} "
+          f"raw@D3={raw_at_d3_str} filtered={stats['filtered_accuracy']:.4f} | "
+          f"unconstrained={stats['unconstrained_tokens']} "
+          f"null_gold={stats['null_gold']} "
+          f"gold_illegal={stats['gold_illegal']} "
+          f"masked={stats['masked_tokens']}")
+    print("[policy] Filtered accuracy computed with Exclude policy over D3 "
+          "(constrained & non-null & non-illegal-gold tokens only). "
+          "Fair comparison: filtered ≥ raw@D3")
 
 
 def test(test_data, model_path, word_dict_path, char_dict_path, bpe_dict_path,
          tag_dict_path, word_emb_dim, char_emb_dim, hidden_dim, dropout,
          num_kernels, kernel_width, by_char=False, by_bpe=False, out_path=None,
          cnn=False, directions=1, device='cpu', morph=False, use_true_pos=False,
-         test_sent_sources=None):
+         test_sent_sources=None, enforce_legal_morphology=False, mask_val=False):
     """
 
     Prepares all the data, and then calls the function that actually runs testing
@@ -699,11 +985,15 @@ def test(test_data, model_path, word_dict_path, char_dict_path, bpe_dict_path,
         logger.info(f"Finished preparing MTL data:")
         logger.info(datetime.datetime.now().strftime("%H:%M:%S"))
 
-        mtl_results = test_morph_tag(test_sents, all_test_field_tags, test_words, model_path,
-                                     word_to_ix, char_to_ix, bpe_to_ix, all_field_dict_paths,
-                                     word_emb_dim, char_emb_dim, hidden_dim, dropout, num_kernels, kernel_width,
-                                     by_char, by_bpe, out_path, cnn, directions, device, field_names=field_names,
-                                     test_sent_sources=test_sent_sources)
+        mtl_results = test_morph_tag(test_sents=test_sents, test_field_tags=all_test_field_tags, test_words=test_words,
+                                     model_path=model_path, word_dict=word_to_ix, char_dict=char_to_ix,
+                                     bpe_dict=bpe_to_ix, tag_dict_path_list=all_field_dict_paths,
+                                     word_emb_dim=word_emb_dim, char_emb_dim=char_emb_dim, hidden_dim=hidden_dim,
+                                     dropout=dropout, num_kernels=num_kernels, kernel_width=kernel_width,
+                                     legal_morph=enforce_legal_morphology, by_char=by_char, by_bpe=by_bpe,
+                                     out_path=out_path, cnn=cnn, directions=directions, device=device,
+                                     field_names=field_names, test_sent_sources=test_sent_sources,
+                                     mask_inference=mask_val)
         return mtl_results
 
     results = []
@@ -713,13 +1003,18 @@ def test(test_data, model_path, word_dict_path, char_dict_path, bpe_dict_path,
     pos_out_path = out_path + f"-pos"
 
     pos_tag_to_ix = torch.load(pos_dict_path)
+    ix_to_pos = reverse_dict(pos_tag_to_ix)
     test_pos_tags = [[prepare_target(tag_sets, pos_tag_to_ix, field_idx=0).to(device=device)]
                        for (train_sent, tag_sets) in test_data]
 
-    pos_results = test_morph_tag(test_sents, test_pos_tags, test_words, pos_model_path, word_to_ix, char_to_ix,
-                                 bpe_to_ix, [pos_dict_path], word_emb_dim, char_emb_dim, hidden_dim, dropout,
-                                 num_kernels, kernel_width, by_char, by_bpe, pos_out_path, cnn, directions, device,
-                                 field_names=["pos"], return_shaped_results=(morph==HIERARCHICAL),
+    pos_results = test_morph_tag(test_sents=test_sents, test_field_tags=test_pos_tags, test_pos_tags=test_pos_tags, test_words=test_words,
+                                 field_index=None, model_path=pos_model_path, word_dict=word_to_ix,
+                                 char_dict=char_to_ix,
+                                 bpe_dict=bpe_to_ix, tag_dict_path_list=[pos_dict_path], word_emb_dim=word_emb_dim,
+                                 char_emb_dim=char_emb_dim, hidden_dim=hidden_dim, dropout=dropout,
+                                 num_kernels=num_kernels, kernel_width=kernel_width, legal_morph=False, by_char=by_char,
+                                 by_bpe=by_bpe, out_path=pos_out_path, cnn=cnn, directions=directions, device=device,
+                                 field_names=["pos"], return_shaped_results=(morph == HIERARCHICAL),
                                  test_sent_sources=test_sent_sources)
     results.append(pos_results)
 
@@ -731,7 +1026,7 @@ def test(test_data, model_path, word_dict_path, char_dict_path, bpe_dict_path,
             if use_true_pos:
                 test_pos = [tags[0] for tags in test_pos_tags]
             else:
-                test_pos = [tags[0] for tags in pos_results[1]]
+                test_pos = [tags[0] if tags else [] for tags in pos_results[1]]
             if by_bpe or by_char:
                 test_sents = [[(idxs[0], idxs[1], tag_idx) for idxs, tag_idx in zip(sent, sent_tags)]
                               for sent, sent_tags in zip(test_sents, test_pos)]
@@ -743,23 +1038,27 @@ def test(test_data, model_path, word_dict_path, char_dict_path, bpe_dict_path,
         else:
             results[0] = pos_results[0]
 
-        for field_idx, field in enumerate(field_names[1:]):
-
+        for field_idx, field_name in enumerate(field_names[1:], start=1):
             field_idx += 1
 
-            field_model_path = model_path_parts[0] + f"-{field}." + model_path_parts[1]
-            field_dict_path = dict_path_parts[0] + f"-{field}." + dict_path_parts[1]
-            field_out_path = out_path + f"-{field}"
+            field_model_path = model_path_parts[0] + f"-{field_name}." + model_path_parts[1]
+            field_dict_path = dict_path_parts[0] + f"-{field_name}." + dict_path_parts[1]
+            field_out_path = out_path + f"-{field_name}"
 
             field_tag_to_ix = torch.load(field_dict_path)
             test_field_tags = [[prepare_target(tag_sets, field_tag_to_ix, field_idx=field_idx).to(device=device)]
                                for (train_sent, tag_sets) in test_data]
 
-            field_results = test_morph_tag(test_sents, test_field_tags, test_words, field_model_path, word_to_ix,
-                                           char_to_ix, bpe_to_ix, [field_dict_path], word_emb_dim, char_emb_dim,
-                                           hidden_dim, dropout, num_kernels, kernel_width, by_char, by_bpe,
-                                           field_out_path, cnn, directions, device, pos_dict_size=pos_dict_size,
-                                           field_names=[field], test_sent_sources=test_sent_sources)
+            field_results = test_morph_tag(test_sents, test_field_tags, test_pos_tags, test_words,
+                                           field_idx,
+                                           field_model_path, word_to_ix, char_to_ix, bpe_to_ix, [field_dict_path],
+                                           word_emb_dim, char_emb_dim, hidden_dim, dropout, num_kernels, kernel_width,
+                                           enforce_legal_morphology, by_char, by_bpe, field_out_path, cnn, directions,
+                                           device,
+                                           pos_dict_size, field_names=[field_name],
+                                           test_sent_sources=test_sent_sources,
+                                           mask_inference=mask_val,
+                                           pos_ix_to_tag=ix_to_pos)
             results.append(field_results[0])
 
         return results
@@ -768,11 +1067,11 @@ def test(test_data, model_path, word_dict_path, char_dict_path, bpe_dict_path,
         return pos_results[0]
 
 
-def test_morph_tag(test_sents, test_tags, test_words, model_path, word_dict, char_dict, bpe_dict, tag_dict_path_list,
-                   word_emb_dim, char_emb_dim, hidden_dim, dropout, num_kernels, kernel_width, by_char=False,
-                   by_bpe=False, out_path=None, cnn=False, directions=1, device='cpu',
-                   pos_dict_size=0, return_shaped_results=False, field_names=None, test_sent_sources=None):
-
+def test_morph_tag(test_sents, test_field_tags, test_pos_tags, test_words, field_index, model_path,
+                   word_dict, char_dict, bpe_dict, tag_dict_path_list, word_emb_dim, char_emb_dim, hidden_dim,
+                   dropout, num_kernels, kernel_width, legal_morph, by_char=False, by_bpe=False, out_path=None,
+                   cnn=False, directions=1, device='cpu', pos_dict_size=0, return_shaped_results=False,
+                   field_names=None, test_sent_sources=None, mask_inference=False, pos_ix_to_tag=None):
     if not out_path:
         out_path = str(datetime.date.today())
 
@@ -781,11 +1080,9 @@ def test_morph_tag(test_sents, test_tags, test_words, model_path, word_dict, cha
     else:
         map_location = 'cpu'
 
-    # checkpoint = torch.load(load_path, map_location=map_location)
-
-    # tag_dicts are dictionaries mapping tag to index
     tag_dict_list = [torch.load(tag_dict_path) for tag_dict_path in tag_dict_path_list]
 
+    ix_to_tag_list = [reverse_dict(tag_dict) for tag_dict in tag_dict_list]
     base_model = base_model_factory(by_char or by_bpe, cnn)
 
     model = MTLWrapper(word_emb_dim, char_emb_dim, hidden_dim, dropout, len(word_dict),
@@ -797,47 +1094,124 @@ def test_morph_tag(test_sents, test_tags, test_words, model_path, word_dict, cha
     model = model.to(device=device)
 
     tag_scores = predict_tags(model, test_sents)
-    if return_shaped_results:
-        # shape of tag_scores: [first sentence:[[(all tag scores for w1_f1 - max is the score you want),
-        #                                        (w2_f1)], [(w1_f2), (w2_f2)...]...],
-        #                      [second sentence: [[(w1_f1), (w2_f1), (w3_f1)], [(w1_f2), (w2_f2), (w3_f2)]]]
-        shaped_results = [[[np.argmax(word_scores.cpu().detach().numpy()) for word_scores in field_scores]
-                           for field_scores in sentence_scores]
-                          for sentence_scores in tag_scores]
 
-    ix_to_tag_list = [reverse_dict(tag_dict) for tag_dict in tag_dict_list]
+    num_fields = len(tag_dict_list)
+    if not field_names or len(field_names) != num_fields:
+        if not field_names:
+            field_names = [f"{i}" for i in range(num_fields)]
+        elif len(field_names) != num_fields:
+            field_names = [f"{i}" for i in range(num_fields)]
+
+    pos_list = flatten_pos_sequences(test_pos_tags)
+    all_field_logits = [extract_field_logits(tag_scores, idx) for idx in range(num_fields)]
+    gold_per_field = [select_gold_field_tags(test_field_tags, idx) for idx in range(num_fields)]
+
+    effective_pos_ix = pos_ix_to_tag
+    if effective_pos_ix is None and num_fields > 1:
+        effective_pos_ix = ix_to_tag_list[0]
+
+    per_field_predictions = []
+    field_stats = []
+
+    for local_idx in range(num_fields):
+        if num_fields == 1:
+            global_idx = field_index if field_index is not None else 0
+        else:
+            global_idx = local_idx
+        field_name = field_names[local_idx]
+        field_tag_to_ix = tag_dict_list[local_idx]
+        field_ix_to_tag = ix_to_tag_list[local_idx]
+        field_logits = all_field_logits[local_idx]
+        gold_field = gold_per_field[local_idx]
+
+        raw_acc = calculate_accuracy(field_logits, gold_field)
+        logger.info(f"[test raw] {field_name} raw (D1) {raw_acc:.4f}")
+
+        apply_mask = (
+            mask_inference and legal_morph and global_idx is not None and global_idx > 0
+        )
+        filtered_logits = field_logits
+        filt_stats = None
+
+        if apply_mask:
+            if not pos_list:
+                logger.warning(f"Skipping legal-morph mask for {field_name}: missing POS sequences.")
+            elif effective_pos_ix is None:
+                logger.warning(f"Skipping legal-morph mask for {field_name}: missing POS vocabulary.")
+            else:
+                diag_ctr = new_diag()
+                filtered_logits = apply_legal_mask(
+                    predicted_sents=field_logits,
+                    pos_list=pos_list,
+                    field_tag_to_ix=field_tag_to_ix,
+                    field_ix_to_tag=field_ix_to_tag,
+                    pos_ix_to_tag=effective_pos_ix,
+                    field_idx=global_idx,
+                    field_name=field_name,
+                    diag_ctr=diag_ctr
+                )
+                legal_rules_for_field = get_legal_rules_for_field(global_idx)
+                _, filt_stats = calculate_accuracy_for_filtered_predictions(
+                    filtered_logits,
+                    gold_field,
+                    pos_list=pos_list,
+                    field_idx=global_idx,
+                    field_tag_to_ix=field_tag_to_ix,
+                    field_ix_to_tag=field_ix_to_tag,
+                    pos_ix_to_tag=effective_pos_ix,
+                    legal_rules_for_field=legal_rules_for_field,
+                    raw_unmasked_scores=field_logits
+                )
+                if filt_stats is not None:
+                    warn_if_filtered_lt_raw(filt_stats, "test")
+                    log_filtered_policy_stats("test", field_name, filt_stats)
+                    raw_at_d3_val = filt_stats.get('raw_at_d3')
+                    raw_at_d3_str = f"{raw_at_d3_val:.4f}" if raw_at_d3_val is not None else "n/a"
+                    logger.info(f"[test raw@D3] {field_name} raw@D3 {raw_at_d3_str}")
+                    logger.info(f"[test filtered] {field_name} filtered (D3) {filt_stats['filtered_accuracy']:.4f}")
+
+        predictions = logits_to_predictions(filtered_logits)
+        per_field_predictions.append(predictions)
+        field_stats.append(filt_stats)
+
+    results = combine_field_predictions(per_field_predictions)
+    shaped_results = results if return_shaped_results else None
+
     literal_test_tags = []
-    for sent in test_tags:
+    for sent in test_field_tags:
         sent_literal = []
         for field_idx, field_tags in enumerate(sent):
-            field_literal = [ix_to_tag_list[field_idx].get(tag.item(), 'OOV') for tag in field_tags]
+            ix_map = ix_to_tag_list[field_idx if field_idx < len(ix_to_tag_list) else 0]
+            if isinstance(ix_map, dict):
+                field_literal = [ix_map.get(tag.item(), 'OOV') for tag in field_tags]
+            else:
+                field_literal = [ix_map[tag.item()] if tag.item() < len(ix_map) else 'OOV' for tag in field_tags]
             sent_literal.append(field_literal)
         literal_test_tags.append(sent_literal)
-
-    write_predictions_to_file(test_sents, test_words, tag_scores, out_path+"-tagged.tsv", ix_to_tag_list, word_dict,
-                              ground_truth=literal_test_tags, field_names=field_names,
-                              test_sent_sources=test_sent_sources)
-
-    results = [[[np.argmax(word_scores.cpu().detach().numpy()) for word_scores in field_scores]
-                for field_scores in sentence_scores] for sentence_scores in tag_scores]
 
     literal_test_predicted = []
     for sent in results:
         sent_literal = []
         for field_idx, field_tags in enumerate(sent):
-            field_literal = [ix_to_tag_list[field_idx].get(tag.item(), 'OOV') for tag in field_tags]
+            ix_map = ix_to_tag_list[field_idx if field_idx < len(ix_to_tag_list) else 0]
+            if isinstance(ix_map, dict):
+                field_literal = [ix_map.get(tag, 'OOV') for tag in field_tags]
+            else:
+                field_literal = [ix_map[tag] if 0 <= tag < len(ix_map) else 'OOV' for tag in field_tags]
             sent_literal.append(field_literal)
         literal_test_predicted.append(sent_literal)
+
+    write_predictions_to_file(results, test_sents, test_words, out_path + "-tagged.tsv",
+                              ix_to_tag_list, ground_truth=literal_test_tags, field_names=field_names,
+                              test_sent_sources=test_sent_sources)
+
     report_dicts = get_classification_report(literal_test_tags, literal_test_predicted, out_path, model_path,
                                             len(tag_dict_list), field_names=field_names)
 
-    if not field_names:
-        field_names = [f"{i}" for i in range(len(report_dicts))]
-
-    for field_name, report_dict in zip(field_names, report_dicts):
-        logger.info(f"Result {field_name} precision: {report_dict['accuracy']}")
-        logger.info(f"Result {field_name} (weighted) recall: {report_dict['weighted avg']['recall']}")
-        logger.info(f"Result {field_name} (weighted) f1: {report_dict['weighted avg']['f1-score']}")
+    for fname, report_dict in zip(field_names, report_dicts):
+        logger.info(f"Result {fname} precision: {report_dict['accuracy']}")
+        logger.info(f"Result {fname} (weighted) recall: {report_dict['weighted avg']['recall']}")
+        logger.info(f"Result {fname} (weighted) f1: {report_dict['weighted avg']['f1-score']}")
     if return_shaped_results:
         return report_dicts, shaped_results
     return report_dicts
@@ -863,10 +1237,8 @@ def get_classification_report(test_tags, test_predicted, out_path, model_path, n
     return report_dicts
 
 
-def write_predictions_to_file(sentences, test_words, tag_scores, out_path, tag_dict_list, word_dict, ground_truth=None,
+def write_predictions_to_file(results, sentences, test_words, out_path, tag_dict_list, ground_truth=None,
                               field_names=None, test_sent_sources=None):
-    results = [[[np.argmax(word_scores.cpu().detach().numpy()) for word_scores in field_scores]
-                for field_scores in sentence_scores] for sentence_scores in tag_scores]
     if not test_sent_sources:
         test_sent_sources = [("", "") for _ in sentences]
     num_fields = len(tag_dict_list)
@@ -914,36 +1286,12 @@ def write_predictions_to_file(sentences, test_words, tag_scores, out_path, tag_d
 def tag(data_path, model_path, word_dict_path, char_dict_path,
         bpe_dict_path, tag_dict_path, word_emb_dim, char_emb_dim, hidden_dim, dropout,
         num_kernels, kernel_width, by_char=False, by_bpe=False,
-        out_path=None, cnn=False, directions=1, device='cpu', morph=None, use_true_pos=False):
-    """
-
-    :param data_path:
-    :param model_path:
-    :param word_dict_path:
-    :param char_dict_path:
-    :param bpe_dict_path:
-    :param tag_dict_path:
-    :param word_emb_dim:
-    :param char_emb_dim:
-    :param hidden_dim:
-    :param dropout:
-    :param num_kernels:
-    :param kernel_width:
-    :param by_char:
-    :param by_bpe:
-    :param out_path:
-    :param cnn:
-    :param directions:
-    :param device:
-    :param morph:
-    :param use_true_pos:
-    :return:
-    """
-    # This is the function for actually just tagging
+        out_path=None, cnn=False, directions=1, device='cpu', morph=None, use_true_pos=False,
+        legal_morph=False, mask_val=False):
     untagged_data, untagged_sent_objects = load_data.prepare_untagged_data(data_path)
     untagged_sents = [sent for sent in untagged_data if len(sent) > 0]
-    if len(untagged_sents) != len(untagged_sent_objects):
-        print("Length of sentences not the same!!!!!!")
+
+    assert len(untagged_sents) == len(untagged_sent_objects), "Length of sentences not the same!"
 
     model_path_parts = model_path.split(".")
     dict_path_parts = tag_dict_path.split(".")
@@ -966,6 +1314,10 @@ def tag(data_path, model_path, word_dict_path, char_dict_path,
     tag_dict_list = [torch.load(tag_dict_path) for tag_dict_path in tag_dict_path_list]
     ix_to_tag_list = [reverse_dict(tag_dict) for tag_dict in tag_dict_list]
 
+    if DEBUG_MASK:
+        for f, ix_to_tag in enumerate(ix_to_tag_list):
+            expected = set(range(len(ix_to_tag)))
+            assert expected == set(ix_to_tag.keys()), "ix_to_tag is missing indices"
     base_model = base_model_factory(by_char or by_bpe, cnn)
 
     if by_char:
@@ -983,11 +1335,32 @@ def tag(data_path, model_path, word_dict_path, char_dict_path,
         model.load_state_dict(torch.load(model_path, map_location=map_location))
         model = model.to(device=device)
         tag_scores = predict_tags(model, test_words)
-        results = [[[np.argmax(word_scores.cpu().detach().numpy()) for word_scores in field_scores]
-                     for field_scores in sentence_scores] for sentence_scores in tag_scores]
+        pos_list = flatten_pos_sequences(
+            [[sentence_scores[0].argmax(dim=1).detach().cpu()] if sentence_scores else [] for sentence_scores in tag_scores]
+        )
+
+        per_field_predictions = []
+        for field_idx, field_name in enumerate(field_names):
+            field_logits = extract_field_logits(tag_scores, field_idx)
+            apply_mask = legal_morph and mask_val and field_idx > 0
+            if apply_mask and pos_list:
+                masked_logits = apply_legal_mask(
+                    predicted_sents=field_logits,
+                    pos_list=pos_list,
+                    field_tag_to_ix=tag_dict_list[field_idx],
+                    field_ix_to_tag=ix_to_tag_list[field_idx],
+                    pos_ix_to_tag=ix_to_tag_list[0],
+                    field_idx=field_idx,
+                    field_name=field_name
+                )
+                logits_for_decode = masked_logits
+            else:
+                logits_for_decode = field_logits
+            per_field_predictions.append(logits_to_predictions(logits_for_decode))
+
+        results = combine_field_predictions(per_field_predictions)
 
     else:
-        results_by_field = []
         pos_model_path = model_path_parts[0] + f"-pos." + model_path_parts[1]
         pos_dict = tag_dict_list[0]
         model = MTLWrapper(word_emb_dim, char_emb_dim, hidden_dim, dropout, len(word_dict),
@@ -1000,12 +1373,28 @@ def tag(data_path, model_path, word_dict_path, char_dict_path,
 
         tag_scores = predict_tags(model, test_words)
 
-        results_by_field.append([[[np.argmax(word_scores.cpu().detach().numpy()) for word_scores in field_scores]
-                                  for field_scores in sentence_scores] for sentence_scores in tag_scores])
+        pos_sentences = []
+        for sent_idx, sentence_scores in enumerate(tag_scores):
+            sentence_results = []
+            for _, field_scores in enumerate(sentence_scores):
+                field_results = []
+                for word_idx, word_scores in enumerate(field_scores):
+                    if legal_morph:
+                        filter_invalid_pos_tags(ix_to_tag_list, field_results, untagged_sents,
+                                                word_scores, sent_idx, word_idx)
+                    else:
+                        field_results.append(np.argmax(word_scores.cpu().detach().numpy()))
+                sentence_results.append(field_results)
+            pos_sentences.append(sentence_results)
+
+        results_by_field = [pos_sentences]
+        pos_sentence_preds = [sentence[0] if sentence else [] for sentence in pos_sentences]
+        mask_pos_list = [torch.LongTensor(seq) for seq in pos_sentence_preds]
 
         if morph == FLAT or morph == HIERARCHICAL:
 
             pos_dict_size = 0
+            mask_pos_for_fields = [tensor.detach().cpu() for tensor in mask_pos_list]
 
             if morph == HIERARCHICAL:
                 if use_true_pos:
@@ -1014,22 +1403,21 @@ def tag(data_path, model_path, word_dict_path, char_dict_path,
                     test_pos = [[word_an.pos for word_an in sent_obj.word_analyses]
                                 for sent_obj in untagged_sent_objects]
                     test_pos = [torch.LongTensor([get_index(pos, pos_dict) for pos in sent_poses]).to(device=device) for sent_poses in test_pos]
+                    mask_pos_for_fields = [tensor.detach().cpu() for tensor in test_pos]
                 else:
-                    test_pos = [sent[0] for sent in results_by_field[0]]
+                    test_pos = [torch.LongTensor(sentence).to(device=device) for sentence in pos_sentence_preds]
+                    mask_pos_for_fields = [tensor.detach().cpu() for tensor in test_pos]
 
                 if by_bpe or by_char:
-                    test_words = [[(idxs[0], idxs[1], tag_idx) for idxs, tag_idx in zip(sent, sent_tags)]
-                                  for sent, sent_tags in zip(test_words, test_pos)]
+                    test_words = [[(idxs[0], idxs[1], tag_idx) for idxs, tag_idx in zip(sentence, sent_tags)]
+                                  for sentence, sent_tags in zip(test_words, test_pos)]
                 else:
-                    test_words = [[(word_idx, tag_idx) for word_idx, tag_idx in zip(sent, sent_tags)]
-                                  for sent, sent_tags in zip(test_words, test_pos)]
+                    test_words = [[(word_idx, tag_idx) for word_idx, tag_idx in zip(sentence, sent_tags)]
+                                  for sentence, sent_tags in zip(test_words, test_pos)]
                 pos_dict_size = len(tag_dict_list[0])
 
-            for field_idx, field in enumerate(field_names[1:]):
-
-                field_idx += 1
-
-                field_model_path = model_path_parts[0] + f"-{field}." + model_path_parts[1]
+            for field_idx, field_name in enumerate(field_names[1:], start=1):
+                field_model_path = model_path_parts[0] + f"-{field_name}." + model_path_parts[1]
                 model = MTLWrapper(word_emb_dim, char_emb_dim, hidden_dim, dropout, len(word_dict),
                                    len(char_dict) if by_char else len(bpe_dict), [len(tag_dict_list[field_idx])],
                                    num_kernels, kernel_width, directions=directions, device=device,
@@ -1040,15 +1428,30 @@ def tag(data_path, model_path, word_dict_path, char_dict_path,
 
                 tag_scores = predict_tags(model, test_words)
 
-                # TODO make sure shape is appropriate.
-                results_by_field.append([[[np.argmax(word_scores.cpu().detach().numpy())
-                                           for word_scores in field_scores]
-                                          for field_scores in sentence_scores]
-                                         for sentence_scores in tag_scores])
-            results = reshape_by_field_to_by_sent(results_by_field)
+                field_logits = extract_field_logits(tag_scores, 0)
+                apply_mask = legal_morph and mask_val and mask_pos_for_fields
+                if apply_mask:
+                    masked_logits = apply_legal_mask(
+                        predicted_sents=field_logits,
+                        pos_list=mask_pos_for_fields,
+                        field_tag_to_ix=tag_dict_list[field_idx],
+                        field_ix_to_tag=ix_to_tag_list[field_idx],
+                        pos_ix_to_tag=ix_to_tag_list[0],
+                        field_idx=field_idx,
+                        field_name=field_name
+                    )
+                    logits_for_decode = masked_logits
+                else:
+                    logits_for_decode = field_logits
+
+                field_predictions = logits_to_predictions(logits_for_decode)
+                wrapped_predictions = [[sentence_preds] for sentence_preds in field_predictions]
+                results_by_field.append(wrapped_predictions)
+
+            results = reshape_by_field_to_by_sent(results_by_field, num_fields=len(field_names))
         else:
             # this is POS only tagging
-            results = reshape_by_field_to_by_sent(results_by_field, num_fields=1)  # TODO make sure this is correct
+            results = reshape_by_field_to_by_sent(results_by_field, num_fields=1)
 
     updated_sentences = add_tags_to_sent_objs(untagged_sent_objects, results, ix_to_tag_list, field_names)
     write_tagged_sents(updated_sentences, out_path)
@@ -1066,7 +1469,11 @@ def reshape_by_field_to_by_sent(results_by_field, num_fields=5):
     for sentence_idx in range(len(results_by_field[0])):
         sentence_words = []
         for field_idx in range(num_fields):
-            sentence_words.append(results_by_field[field_idx][sentence_idx][0])
+            if results_by_field[field_idx][sentence_idx]:
+                sentence_words.append(results_by_field[field_idx][sentence_idx][0])
+            else:
+                # in case the sentence is invalid
+                sentence_words.append([])
         sentences.append(sentence_words)
     return sentences
 
@@ -1100,7 +1507,7 @@ def kfold_val(data_paths, model_path, word_dict_path, char_dict_path, bpe_path,
               tag_dict_path, result_path, k, word_emb, char_emb, hidden_dim,
               dropout, num_kernels=1000, kernel_width=6, by_char=False, by_bpe=False,
               with_smoothing=False, cnn=False, directions=1, device='cpu',
-              epochs=300, morph=None, weight_decay=0, use_true_pos=False, loss_weights=(1,1,1,1,1)):
+              epochs=300, morph=None, weight_decay=0, use_true_pos=False, loss_weights=(1,1,1,1,1), legal_morph=False):
     logger.info("Beginning k-fold validation")
     results = []
     fold = 0
@@ -1117,13 +1524,14 @@ def kfold_val(data_paths, model_path, word_dict_path, char_dict_path, bpe_path,
               new_char_path, new_bpe_path, new_tag_path, train_word_count, word_emb,
               char_emb, hidden_dim, dropout, num_kernels, kernel_width, by_char, by_bpe,
               with_smoothing, cnn, directions, device, epochs=epochs, morph=morph,
-              weight_decay=weight_decay, loss_weights=loss_weights)
+              weight_decay=weight_decay, loss_weights=loss_weights, legal_morph=legal_morph)
 
         new_result_path = add_fold_dir_to_path(result_path, fold)
         results.append(test(test_sentences, new_model_path, new_word_path, new_char_path, new_bpe_path,
                             new_tag_path, word_emb, char_emb, hidden_dim, dropout, num_kernels,
                             kernel_width, by_char, by_bpe, out_path=new_result_path,
-                            cnn=cnn, directions=directions, device=device, morph=morph, use_true_pos=use_true_pos))
+                            cnn=cnn, directions=directions, device=device, morph=morph, use_true_pos=use_true_pos,
+                            enforce_legal_morphology=legal_morph, mask_val=legal_morph))
 
         fold += 1
     agg_result_path = result_path + ".agg_res"
@@ -1201,12 +1609,10 @@ def add_fold_dir_to_path(path, fold_num):
 def main(args):
     today = str(datetime.date.today())
 
-    log_name = args.log_file if args.log_file else '{}.log'.format(today)
+    log_name = args.log_file if args.log_file else f"{today}.log"
     split_path = os.path.split(log_name)
-    if not os.path.exists(split_path[0]):
-        os.mkdir(split_path[0])
-    logger.addHandler(logging.FileHandler(log_name, 'w+'))
-
+    # if not os.path.exists(split_path[0]):
+    #     os.mkdir(split_path[0])
     char_based = args.char_based
     bpe_based = args.bpe_based
     smoothed = True if args.smoothed else False
@@ -1248,7 +1654,8 @@ def main(args):
               kernel_width=args.kernel_width, with_smoothing=smoothed,
               by_char=char_based, by_bpe=bpe_based, cnn=args.cnn, directions=args.directions,
               device=args.device, epochs=args.epochs, lr=args.learning_rate,
-              batch_size=args.batch_size, morph=morph, loss_weights=args.loss_weights, seed=args.seed)
+              batch_size=args.batch_size, morph=morph, loss_weights=args.loss_weights, seed=args.seed,
+              legal_morph=args.legal_morph)
     elif args.test:
         test_data, sources = load_data.prepare_test_data(args.data_paths, out_dir=args.model_dir, sources=True)
 
@@ -1259,7 +1666,8 @@ def main(args):
              num_kernels=args.num_kernels, kernel_width=args.kernel_width,
              by_char=char_based, by_bpe=bpe_based, cnn=args.cnn, directions=args.directions,
              out_path=args.result_path, device=args.device, morph=morph, use_true_pos=args.use_true_pos,
-             test_sent_sources=sources)
+             test_sent_sources=sources, enforce_legal_morphology=args.legal_morph,
+             mask_val=args.mask_val)
 
     elif args.tag:
         tag(args.data_paths, model_path, word_dict_path, char_dict_path, bpe_dict_path,
@@ -1267,7 +1675,9 @@ def main(args):
             hidden_dim=args.hidden_dim, dropout=args.dropout,
             num_kernels=args.num_kernels, kernel_width=args.kernel_width,
             by_char=char_based, by_bpe=bpe_based, cnn=args.cnn, directions=args.directions,
-            out_path=args.result_path, device=args.device, morph=morph, use_true_pos=args.use_true_pos)
+            out_path=args.result_path, device=args.device, morph=morph, use_true_pos=args.use_true_pos,
+            legal_morph=args.legal_morph, mask_val=args.mask_val)
+
     elif args.kfold_validation:
         kfold_val(args.data_paths, model_path, word_dict_path,
                   char_dict_path, bpe_dict_path, tag_dict_path,
@@ -1275,7 +1685,7 @@ def main(args):
                   args.hidden_dim, args.dropout, args.num_kernels, args.kernel_width,
                   char_based, bpe_based, cnn=args.cnn, directions=args.directions,
                   device=args.device, epochs=args.epochs, morph=morph, use_true_pos=args.use_true_pos,
-                  loss_weights=args.loss_weights)
+                  loss_weights=args.loss_weights, legal_morph=args.legal_morph)
     else:
         print("Must select either train (-r), test (-e) or tag (-a)")
 
@@ -1384,7 +1794,18 @@ if __name__ == '__main__':
                         type=int,
                         default=math.inf,
                         help='For training on smaller (random) subset of input sentences')
-    
+    parser.add_argument('--legal_morph',
+                        action='store_true',
+                        help='Enforce legal morphological values according to constrains in legal_values.json')
+    parser.add_argument('--mask_train', action='store_true', default=False,
+                        help='Apply legal-morph masking during training (before loss).')
+    parser.add_argument('--mask_val', action='store_true', default=False,
+                        help='Apply legal-morph masking during validation/inference.')
+    parser.add_argument('--treat_gold_illegal_as_underscore', action='store_true', default=True,
+                        help='When gold is illegal or None under legal-morph, treat "_" as the correct filtered label.')
+    parser.add_argument('--verbose_mask_debug', action='store_true',
+                        help='Print detailed masking diagnostics each epoch.')
+
     args, unknown = parser.parse_known_args()
 
     args.device = None
@@ -1392,6 +1813,19 @@ if __name__ == '__main__':
         args.device = torch.device('cuda')
     else:
         args.device = torch.device('cpu')
+
+    # if legal_morph is True and user didn't pass either flag, set mask_val=True
+    if getattr(args, 'legal_morph', False):
+        if not any([getattr(args, 'mask_train', False), getattr(args, 'mask_val', False)]):
+            args.mask_val = True    # val-only masking, by default
+
+    set_verbose_mask_debug(getattr(args, 'verbose_mask_debug', False))
+
+    # quiet the RNN dropout warning for single-layer models
+    if hasattr(args, "dropout") and args.dropout > 0:
+        # if using a single-layer model (default for most architectures)
+        print("[note] Setting dropout=0 to avoid ineffective-dropout warning for single-layer models.")
+        args.dropout = 0.0
 
     if args.debug:
         logger.setLevel(level=logging.DEBUG)
@@ -1406,4 +1840,17 @@ if __name__ == '__main__':
     if args.testing:
         print(args)
     else:
+        if args.legal_morph:
+            # if enforcing legal morphological values, load legal_values.json handed globally
+            with open("legal_values.json", encoding='utf-8') as legal_values_file:
+                legal_values = json.load(legal_values_file)
+
+        # logger for mask warnings
+        mask_logger = logging.getLogger('mask_warnings')
+        mask_logger.setLevel(logging.INFO)
+        mask_handler = logging.FileHandler('mask_warnings.log', mode='a', encoding='utf-8')
+        mask_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+        if not mask_logger.hasHandlers():
+            mask_logger.addHandler(mask_handler)
+
         main(args)
