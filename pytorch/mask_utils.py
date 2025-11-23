@@ -25,14 +25,17 @@ def set_verbose_mask_debug(enabled):
 
 """
 Unconstrained vs. constrained rules:
-    - RULELESS / UNCONSTRAINED: no rule exists for field. contribute to D1 (TOTAL) but not D2 or D3
-    - HAS RULE / CONSTRAINED: a non-empty rule list (not ["NA"])
+    - RULELESS / UNCONSTRAINED: no rule exists for field (None, empty list, empty string).
+      Contribute to D1 (TOTAL) but not D2 or D3
+    - HAS RULE / CONSTRAINED: a non-empty rule list (including ["NA"] which means "NA is the legal value")
     - ENC rules are not POS conditioned. "NA" is valid and means no enclitic
+    - NOTE: If "NA" appears in legal_values.json for a POS/field, it's an active constraint,
+      meaning "NA is the legal value for this field"
 
 Filtering strategy:
     - D1 counts every token
-    - D2 keeps only constrained ones
-    - D3 keeps the constrained tokens whose gold tags are non-null and legal
+    - D2 keeps only constrained ones (including tokens with ["NA"] rules)
+    - D3 keeps the constrained tokens whose gold tags are legal (including "NA" if it's in the legal values)
     - raw@D3 evaluates pre-masked accuracy on D3 so it is comparable to filtered accuracy (also on D3)
     - Unconstrained and null-gold tokens never enter D3.
 """
@@ -94,15 +97,23 @@ def analysis_key_for_field(field_idx):
 
 
 def is_rule_unconstrained(rule):
-    """True if the rule supplies no usable tags."""
+    """
+    True if the rule supplies no usable tags.
+    
+    NOTE: "NA" appearing in legal_values.json means "NA is the legal value",
+    so rules containing "NA" are considered active constraints, not unconstrained.
+    Only empty rules (None, empty list, empty string) are considered unconstrained.
+    """
     if rule is None:
         return True
-    if rule == "NA":
-        return True
-    if isinstance(rule, list) and (len(rule) == 0 or rule == ["NA"]):
-        return True
-    if isinstance(rule, (set, tuple)) and len(rule) == 0:
-        return True
+    if isinstance(rule, str):
+        # Empty string is unconstrained, but "NA" is a valid constraint
+        return rule == ""
+    if isinstance(rule, list):
+        # Empty list is unconstrained, but ["NA"] is a valid constraint
+        return len(rule) == 0
+    if isinstance(rule, (set, tuple)):
+        return len(rule) == 0
     return False
 
 
@@ -128,19 +139,6 @@ def get_legal_rules_for_field(field_idx):
         return legal_values.get("enclitic", {})
     else:
         return legal_values.get("pos", {})
-
-
-def is_rule_unconstrained(rule):
-    """True if the rule carries no usable tags."""
-    if rule is None:
-        return True
-    if rule == "NA":
-        return True
-    if isinstance(rule, list) and (len(rule) == 0 or rule == ["NA"]):
-        return True
-    if isinstance(rule, (set, tuple)) and len(rule) == 0:
-        return True
-    return False
 
 
 def mask_tags_1d(tags_1d, allowed_ix_set):
@@ -169,12 +167,18 @@ def is_gold_illegal_or_none(gold_tag_str, pos_label, field_idx, legal_rules):
     else:
         legal_rules_for_field = legal_rules
 
-    # no rule exists or rule is None/"NA" -> not illegal
-    if not legal_rules_for_field or legal_rules_for_field == "NA":
+    # no rule exists -> not illegal (but ["NA"] is a valid rule, so check it)
+    if not legal_rules_for_field:
         return False
 
+    # Convert rule to set for checking
+    if isinstance(legal_rules_for_field, (list, tuple, set)):
+        rule_set = set(legal_rules_for_field)
+    else:
+        rule_set = {legal_rules_for_field}
+
     # If gold_tag_str is not in the rule set, then it's illegal
-    return gold_tag_str not in legal_rules_for_field
+    return gold_tag_str not in rule_set
 
 
 def _pos_to_str(pos_idx, pos_ix_to_tag):
@@ -486,16 +490,20 @@ def calculate_accuracy_for_filtered_predictions(predicted_tag_scores, true_tags_
                             "rule_samples": list(sorted(rule_set))[:5],
                         })
 
-                    if gold_tag_str in {"_", None}:
-                        totals["null_gold"] += 1
-                    elif gold_tag_str not in rule_set:
-                        totals["gold_illegal"] += 1
-                    else:
+                    # Check if gold is in rule_set first (including "NA" if it's legal)
+                    if gold_tag_str in rule_set:
+                        # Legal gold (including "NA" if it's in the legal values)
                         totals["D3"] += 1
                         if preds[word_idx].item() == gold_ix:
                             totals["correct"] += 1
                         if raw_preds is not None and word_idx < raw_preds.numel() and raw_preds[word_idx].item() == gold_ix:
                             totals["raw_correct_d3"] += 1
+                    elif gold_tag_str in {"_", None}:
+                        # Null gold (not in rule_set)
+                        totals["null_gold"] += 1
+                    else:
+                        # Illegal gold (not in rule_set and not null)
+                        totals["gold_illegal"] += 1
 
                     if rule is not None:
                         totals["masked_tokens"] += 1
@@ -766,7 +774,8 @@ def apply_training_mask_and_loss(
             gold_ix = gold[0].reshape(-1)[i].item()
             if gold_ix < len(field_ix_to_tag):
                 gold_tag_str = field_ix_to_tag[gold_ix] if isinstance(field_ix_to_tag, dict) else field_ix_to_tag[gold_ix]
-                if rule is not None and rule != "NA" and not (isinstance(rule, list) and rule == ["NA"]):
+                # Check if rule exists (including ["NA"] which is a valid constraint)
+                if rule is not None and not is_rule_unconstrained(rule):
                     rule_set = set(rule) if isinstance(rule, (list, tuple, set)) else {rule}
                     if gold_tag_str not in rule_set:
                         if blank_ix is not None:
@@ -1065,15 +1074,25 @@ def expect_mask_for_field(field_idx, legal_rules_for_field, field_tag_to_ix):
     try:
         from run import is_rule_unconstrained
     except ImportError:
+        # Fallback definition (should match the main definition above)
         def is_rule_unconstrained(rule):
+            """
+            True if the rule supplies no usable tags.
+            
+            NOTE: "NA" appearing in legal_values.json means "NA is the legal value",
+            so rules containing "NA" are considered active constraints, not unconstrained.
+            Only empty rules (None, empty list, empty string) are considered unconstrained.
+            """
             if rule is None:
                 return True
-            if rule == "NA":
-                return True
-            if isinstance(rule, list) and (len(rule) == 0 or rule == ["NA"]):
-                return True
-            if isinstance(rule, (set, tuple)) and len(rule) == 0:
-                return True
+            if isinstance(rule, str):
+                # Empty string is unconstrained, but "NA" is a valid constraint
+                return rule == ""
+            if isinstance(rule, list):
+                # Empty list is unconstrained, but ["NA"] is a valid constraint
+                return len(rule) == 0
+            if isinstance(rule, (set, tuple)):
+                return len(rule) == 0
             return False
     
     # Handle ENC (field_idx == 4) as flat list
